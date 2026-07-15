@@ -244,6 +244,59 @@ local function bench_apply(label: string, P: number, changed: number)
 	print(string.format("%-34s P=%3d changed=%4d | %8.4f ms/apply (client)", label, P, changed, 1000 * elapsed / REPS))
 end
 
+local function bench_tick_serdes(label: string, P: number, changed: number)
+	-- fixed-bytespan serdes on the hot component: values pack into the packet
+	-- buffer via replecs's buffer-per-value serialize path
+	local world, server, position, _health, _players, entities = setup(P, nil)
+	server:set_serdes(position, {
+		bytespan = 8,
+		serialize = function(value: number): buffer
+			local b = buffer.create(8)
+			buffer.writef64(b, 0, value)
+			return b
+		end,
+		deserialize = function(b: buffer): number
+			return buffer.readf64(b, 0)
+		end,
+	})
+
+	local tick = 0
+	local function dirty()
+		tick += 1
+		for i = 1, changed do
+			world:set(entities[i], position, i * 1.5 + tick)
+		end
+	end
+
+	for _ = 1, WARM do
+		dirty()
+		guard += (drain(server))
+	end
+
+	local elapsed = 0
+	local bytes, variants = 0, 0
+	for _ = 1, REPS do
+		dirty()
+		local t = os.clock()
+		local n, b, v = drain(server)
+		elapsed += os.clock() - t
+		guard += n
+		bytes, variants = b, v
+	end
+
+	print(
+		string.format(
+			"%-34s P=%3d changed=%4d | %8.4f ms/tick | %6d B + %4d values /client",
+			label,
+			P,
+			changed,
+			1000 * elapsed / REPS,
+			bytes,
+			variants
+		)
+	)
+end
+
 local function bench_unreliable(label: string, P: number)
 	-- replecs-only: position marked unreliable instead of reliable; the channel
 	-- resends every marked value each collect, no change tracking involved
@@ -337,6 +390,7 @@ bench_tick("tick: all change, filtered vis", 30, N, 10)
 bench_tick_with_hooks("tick incl. mutation hooks", 30, N)
 bench_join("join: full snapshot", 30)
 bench_apply("client apply: all change", 30, N)
+bench_tick_serdes("tick: all change, serdes position", 30, N)
 bench_unreliable("unreliable tick: all positions", 30)
 print("guard:", guard)
 
