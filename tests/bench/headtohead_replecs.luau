@@ -305,6 +305,19 @@ local function bench_unreliable(label: string, P: number)
 	server:init()
 
 	local position, health, static_tag = make_components(world)
+	-- replecs recommends serdes for every unreliable component so packet
+	-- splitting can size values exactly (duplecs's channel requires it)
+	server:set_serdes(position, {
+		bytespan = 8,
+		serialize = function(value: number): buffer
+			local b = buffer.create(8)
+			buffer.writef64(b, 0, value)
+			return b
+		end,
+		deserialize = function(b: buffer): number
+			return buffer.readf64(b, 0)
+		end,
+	})
 
 	local players = table.create(P) :: { any }
 	for i = 1, P do
