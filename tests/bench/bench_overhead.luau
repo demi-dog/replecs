@@ -24,6 +24,12 @@
 --     packet lazily, so the timed region includes draining it (duplecs's
 --     generate_packets returns finished packets; its drain is a bare count
 --     and stays untimed).
+--   * every server row also prints a mutate/collect split of the same timed
+--     frames: `mutate` is the workload's mutations with replecs's hooks live
+--     (mutate minus plain ~ the per-op capture/staging cost) and `collect` is
+--     the packet build plus drain — so a row says not just how much overhead
+--     replication adds but which phase to optimize. The joiner row splits the
+--     same way into activate (mask migration) and get_full (snapshot build).
 --   * replecs has no equivalent of duplecs's NetworkedOnce tracking mode, so
 --     that row is absent here.
 --   * collect_unreliable re-sends every active unreliable value each call
@@ -191,9 +197,13 @@ local function make_world(P)
 end
 
 -- ---- timing shell: WARM then REPS frames of mutate plus the collect call
--- when one is given, returning nanoseconds per op. The drain runs inside the
--- timed region because replecs materializes each member's packet in the
--- iterator (see the header).
+-- when one is given. The drain runs inside the timed region because replecs
+-- materializes each member's packet in the iterator (see the header). The two
+-- phases of each frame are clocked separately so every row can report where
+-- its overhead lives: `mutate` is the workload's mutations with replecs's
+-- hooks live (so mutate minus the plain column is the per-op capture/staging
+-- cost), `collect` is the packet build plus drain. Returns total, mutate, and
+-- collect nanoseconds per op.
 
 local function measure(mutate, collect, ops)
 	for _ = 1, WARM do
@@ -203,31 +213,35 @@ local function measure(mutate, collect, ops)
 		end
 	end
 
-	local elapsed = 0
+	local mutate_elapsed = 0
+	local collect_elapsed = 0
 	for _ = 1, REPS do
 		local t = os.clock()
 		mutate()
+		local mid = os.clock()
+		mutate_elapsed += mid - t
 		if collect ~= nil then
 			local n = drain(collect())
-			elapsed += os.clock() - t
+			collect_elapsed += os.clock() - mid
 			guard += n
-		else
-			elapsed += os.clock() - t
 		end
 	end
 
-	return 1e9 * elapsed / (REPS * ops)
+	local scale = 1e9 / (REPS * ops)
+	return (mutate_elapsed + collect_elapsed) * scale, mutate_elapsed * scale, collect_elapsed * scale
 end
 
-local function row(label, P, plain_ns, replecs_ns)
+local function row(label, P, plain_ns, replecs_ns, mutate_ns, collect_ns)
 	print(
 		string.format(
-			"%-44s P=%3d | plain %8.1f ns/op | replecs %8.1f ns/op | x%5.2f",
+			"%-44s P=%3d | plain %8.1f ns/op | replecs %8.1f ns/op | x%5.2f | mutate %8.1f + collect %8.1f",
 			label,
 			P,
 			plain_ns,
 			replecs_ns,
-			replecs_ns / plain_ns
+			replecs_ns / plain_ns,
+			mutate_ns,
+			collect_ns
 		)
 	)
 end
@@ -564,15 +578,18 @@ local function run_joiner_row()
 	end
 	guard += drain(server:collect_updates())
 
-	local elapsed = 0
+	local activate_elapsed = 0
+	local full_elapsed = 0
 	local bytes = 0
 	for _ = 1, FULL_REPS do
 		local viewer = {}
 		local t = os.clock()
 		server.masking:register_client(viewer)
 		server.masking:activate_client(viewer)
+		local mid = os.clock()
 		local buf = server:get_full(viewer)
-		elapsed += os.clock() - t
+		full_elapsed += os.clock() - mid
+		activate_elapsed += mid - t
 		bytes = buffer.len(buf)
 		server.masking:unregister_client(viewer)
 	end
@@ -580,11 +597,13 @@ local function run_joiner_row()
 	local cells = FULL_BASE + FULL_BASE // 4 + FULL_PAIRS
 	print(
 		string.format(
-			"full packet: %4d entities, %4d cells        | %8.4f ms/join | %6d B",
+			"full packet: %4d entities, %4d cells        | %8.4f ms/join | %6d B | activate %.4f + get_full %.4f",
 			FULL_BASE,
 			cells,
-			1000 * elapsed / FULL_REPS,
-			bytes
+			1000 * (activate_elapsed + full_elapsed) / FULL_REPS,
+			bytes,
+			1000 * activate_elapsed / FULL_REPS,
+			1000 * full_elapsed / FULL_REPS
 		)
 	)
 end
@@ -1108,7 +1127,8 @@ end
 print(
 	string.format(
 		"replecs end-to-end overhead  cells=%d toggles=%d pairs=%d spawns=%d reps=%d"
-			.. "  (plain = same mutations, no replecs; replecs = mutations + collect + drain, timed together)",
+			.. "  (plain = same mutations, no replecs; replecs = mutations + collect + drain, timed together;"
+			.. " mutate/collect = the same frames' two phases clocked separately)",
 		CELLS,
 		TOGGLES,
 		PAIR_CELLS,
